@@ -11,6 +11,14 @@ import PQueue from '../source/index.js';
 
 const fixture = Symbol('fixture');
 
+// Drain the microtask queue (including the `queueMicrotask(() => this.#next())` hops).
+async function flushMicrotasks(): Promise<void> {
+	for (let index = 0; index < 10; index++) {
+		// eslint-disable-next-line no-await-in-loop
+		await Promise.resolve();
+	}
+}
+
 test('.add()', async () => {
 	const queue = new PQueue();
 	const promise = queue.add(async () => fixture);
@@ -314,6 +322,179 @@ test('.onSizeLessThan() resolves after clear()', async () => {
 
 	assert.equal(queue.size, 0);
 	assert.equal(queue.pending, 0);
+});
+
+test('.onSizeLessThan() resolves on start() before the running task finishes', async () => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	// Controllable long-running task: the queue must shrink as soon as it moves
+	// to running, not when the task settles.
+	const longTask = pDefer();
+	queue.add(() => longTask.promise);
+	queue.add(() => longTask.promise);
+
+	assert.equal(queue.size, 2);
+	assert.equal(queue.pending, 0);
+
+	const timeout = Symbol('timeout');
+	const sizePromise = queue.onSizeLessThan(2);
+
+	queue.start();
+
+	// Must resolve even though the dequeued task has not finished.
+	// eslint-disable-next-line promise/prefer-await-to-then
+	const result = await Promise.race([sizePromise.then(() => 'resolved'), delay(200, {value: timeout})]);
+	assert.notEqual(result, timeout);
+
+	assert.equal(queue.size, 1);
+	assert.equal(queue.pending, 1);
+
+	longTask.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() resolves when concurrency is raised, before tasks finish', async () => {
+	const queue = new PQueue({concurrency: 1});
+
+	const longTask = pDefer();
+	queue.add(() => longTask.promise);
+	queue.add(() => longTask.promise);
+	queue.add(() => longTask.promise);
+
+	assert.equal(queue.size, 2);
+	assert.equal(queue.pending, 1);
+
+	const timeout = Symbol('timeout');
+	const sizePromise = queue.onSizeLessThan(2);
+
+	// Raising concurrency dequeues tasks synchronously; the size drops while
+	// the newly started long tasks are still running.
+	queue.concurrency = 3;
+
+	// eslint-disable-next-line promise/prefer-await-to-then
+	const result = await Promise.race([sizePromise.then(() => 'resolved'), delay(200, {value: timeout})]);
+	assert.notEqual(result, timeout);
+
+	assert.equal(queue.size, 0);
+	assert.equal(queue.pending, 3);
+
+	longTask.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() resolves on an interval tick before running tasks finish', async () => {
+	const queue = new PQueue({concurrency: 2, interval: 100, intervalCap: 1});
+
+	const longTask = pDefer();
+	queue.add(() => longTask.promise);
+	queue.add(() => longTask.promise);
+
+	assert.equal(queue.size, 1);
+	assert.equal(queue.pending, 1);
+
+	const timeout = Symbol('timeout');
+	const sizePromise = queue.onSizeLessThan(1);
+
+	// The next interval tick dequeues the waiting item while the first task
+	// is still running. The waiter must resolve at that tick, not when a task finishes.
+	// eslint-disable-next-line promise/prefer-await-to-then
+	const result = await Promise.race([sizePromise.then(() => 'resolved'), delay(400, {value: timeout})]);
+	assert.notEqual(result, timeout);
+
+	assert.equal(queue.size, 0);
+	assert.equal(queue.pending, 2);
+
+	longTask.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() evaluates waiters with different limits independently in one drain', async () => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	const releases: Array<() => void> = [];
+	// Each task gets its own release; closures are created as tasks dequeue.
+	const task = async () => new Promise<void>(resolve => {
+		releases.push(resolve);
+	});
+
+	for (let index = 0; index < 5; index++) {
+		queue.add(task);
+	}
+
+	assert.equal(queue.size, 5);
+
+	const hits: number[] = [];
+	const recordHit = async (limit: number) => {
+		await queue.onSizeLessThan(limit);
+		hits.push(limit);
+	};
+
+	// Fire-and-forget hit recorders; assertions below observe `hits`.
+	recordHit(6); // Already below the limit: resolves on the next microtask.
+	recordHit(5); // Crossed by the single start() dequeue (size 5 -> 4).
+	recordHit(4); // Not crossed by this drain: stays registered.
+	recordHit(3); // Not crossed by this drain: stays registered.
+
+	queue.start();
+	await flushMicrotasks();
+
+	assert.deepEqual(hits, [6, 5]);
+	assert.equal(queue.size, 4);
+	assert.equal(queue.pending, 1);
+
+	// Finish the running task: the next dequeue takes size 4 -> 3, crossing only limit 4.
+	releases[0]!();
+	await flushMicrotasks();
+
+	assert.deepEqual(hits, [6, 5, 4]);
+	assert.equal(queue.size, 3);
+	assert.equal(queue.pending, 1);
+
+	// One more dequeue takes size 3 -> 2, crossing limit 3.
+	releases[1]!();
+	await flushMicrotasks();
+
+	assert.deepEqual(hits, [6, 5, 4, 3]);
+	assert.equal(queue.size, 2);
+
+	// Let the remaining tasks dequeue and finish.
+	while (queue.size > 0) {
+		releases.pop()!();
+		// eslint-disable-next-line no-await-in-loop
+		await flushMicrotasks();
+	}
+
+	releases.pop()!();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() resolves when a queued task is aborted', async () => {
+	const queue = new PQueue({concurrency: 1});
+
+	const longTask = pDefer();
+	queue.add(() => longTask.promise);
+
+	const controller = new AbortController();
+	const aborted = queue.add(() => longTask.promise, {signal: controller.signal});
+	// eslint-disable-next-line promise/prefer-await-to-then, @typescript-eslint/no-empty-function
+	aborted.catch(() => {}); // Expected AbortError
+
+	assert.equal(queue.size, 1);
+
+	const timeout = Symbol('timeout');
+	const sizePromise = queue.onSizeLessThan(1);
+
+	controller.abort();
+
+	// eslint-disable-next-line promise/prefer-await-to-then
+	const result = await Promise.race([sizePromise.then(() => 'resolved'), delay(200, {value: timeout})]);
+	assert.notEqual(result, timeout);
+
+	assert.equal(queue.size, 0);
+	assert.equal(queue.pending, 1);
+
+	longTask.resolve();
+	await queue.onIdle();
 });
 
 test('.onIdle() - no pending', async () => {
