@@ -316,6 +316,234 @@ test('.onSizeLessThan() resolves after clear()', async () => {
 	assert.equal(queue.pending, 0);
 });
 
+const assertResolvesSoon = async (promise: Promise<unknown>, message: string, timeout = 200): Promise<void> => {
+	let timer: NodeJS.Timeout | undefined;
+	const timeoutPromise = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => {
+			reject(new Error(message));
+		}, timeout);
+	});
+
+	try {
+		await Promise.race([promise, timeoutPromise]);
+	} finally {
+		clearTimeout(timer);
+	}
+};
+
+test('.onSizeLessThan() resolves on start() while the started task is still running', async () => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const blocker = pDefer<void>();
+
+	queue.add(async () => blocker.promise);
+	queue.add(async () => delay(50));
+	queue.add(async () => delay(50));
+
+	assert.equal(queue.size, 3);
+	assert.equal(queue.pending, 0);
+
+	const sizePromise = queue.onSizeLessThan(3);
+
+	queue.start();
+
+	// Calling start() synchronously moved one waiting task into the running
+	// state, so the promise must resolve before that task has finished.
+	await assertResolvesSoon(sizePromise, 'onSizeLessThan() should resolve on start(), not when a task completes');
+
+	assert.equal(queue.size, 2);
+	assert.equal(queue.pending, 1);
+
+	blocker.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() resolves when concurrency is raised while tasks are running', async () => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	const blockers = [pDefer<void>(), pDefer<void>()];
+	const starts: number[] = [];
+
+	queue.add(async () => {
+		starts.push(1);
+		await blockers[0]!.promise;
+	});
+	queue.add(async () => {
+		starts.push(2);
+		await blockers[1]!.promise;
+	});
+	queue.add(async () => delay(50));
+	queue.add(async () => delay(50));
+
+	const sizePromise = queue.onSizeLessThan(3);
+
+	queue.start();
+
+	// One task is now running, three are still waiting: not below 3 yet.
+	assert.deepEqual(starts, [1]);
+	assert.equal(queue.size, 3);
+	assert.equal(queue.pending, 1);
+
+	// Raising the concurrency synchronously moves another waiting task into
+	// the running state; the waiter must resolve without any task completing.
+	queue.concurrency = 2;
+
+	await assertResolvesSoon(sizePromise, 'onSizeLessThan() should resolve when the concurrency setter dequeues a task');
+
+	assert.deepEqual(starts, [1, 2]);
+	assert.equal(queue.size, 2);
+	assert.equal(queue.pending, 2);
+
+	blockers[0]!.resolve();
+	blockers[1]!.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() waiters with different limits are evaluated independently in one drain', async () => {
+	const queue = new PQueue({concurrency: 3, autoStart: false});
+	const blocker = pDefer<void>();
+
+	for (let index = 0; index < 5; index++) {
+		queue.add(async () => blocker.promise);
+	}
+
+	const resolved: number[] = [];
+	const markResolved = async (limit: number, promise: Promise<void>): Promise<void> => {
+		await promise;
+		resolved.push(limit);
+	};
+
+	const waiterBelow5 = markResolved(5, queue.onSizeLessThan(5));
+	const waiterBelow4 = markResolved(4, queue.onSizeLessThan(4));
+	const waiterBelow3 = markResolved(3, queue.onSizeLessThan(3));
+
+	// Size never drops below 2 in this drain (concurrency is 3), so this must not resolve.
+	let below2Resolved = false;
+	const waiterBelow2 = (async () => {
+		await queue.onSizeLessThan(2);
+		below2Resolved = true;
+	})();
+
+	queue.start();
+
+	// Each eligible waiter fires during the single start() drain, at its own
+	// threshold crossing; microtask order mirrors the synchronous resolution order.
+	await assertResolvesSoon(Promise.all([waiterBelow5, waiterBelow4, waiterBelow3]), 'all eligible onSizeLessThan() waiters should resolve during the single start() drain', 300);
+
+	assert.deepEqual(resolved, [5, 4, 3]);
+	assert.equal(below2Resolved, false);
+	assert.equal(queue.size, 2);
+	assert.equal(queue.pending, 3);
+
+	// The unsatisfied waiter stays registered and is served by a later size drop.
+	queue.clear();
+	await waiterBelow2;
+	assert.equal(below2Resolved, true);
+
+	blocker.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() resolves on an interval tick dequeue', async () => {
+	const queue = new PQueue({
+		concurrency: 2,
+		interval: 50,
+		intervalCap: 1,
+		autoStart: false,
+	});
+	const blocker = pDefer<void>();
+
+	queue.add(async () => blocker.promise);
+	queue.add(async () => delay(50));
+	queue.add(async () => delay(50));
+
+	// Calling start() runs only the first task; the interval cap keeps the rest waiting.
+	queue.start();
+
+	assert.equal(queue.size, 2);
+	assert.equal(queue.pending, 1);
+
+	const sizePromise = queue.onSizeLessThan(2);
+
+	// A waiting item leaves the queue on the interval tick, even though the
+	// running task has not finished.
+	await assertResolvesSoon(sizePromise, 'onSizeLessThan() should resolve on the interval tick dequeue', 300);
+
+	assert.equal(queue.size, 1);
+	assert.equal(queue.pending, 2);
+
+	blocker.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() resolves when a queued task is aborted', async () => {
+	const queue = new PQueue({concurrency: 1});
+	const blocker = pDefer<void>();
+
+	queue.add(async () => blocker.promise);
+
+	const controller = new AbortController();
+	const added = queue.add(async () => delay(50), {signal: controller.signal});
+	// Rejection with the abort reason is expected; swallow it to avoid an unhandled rejection.
+	// eslint-disable-next-line promise/prefer-await-to-then
+	void added.catch((error: unknown) => error);
+	queue.add(async () => delay(50));
+
+	assert.equal(queue.size, 2);
+
+	const sizePromise = queue.onSizeLessThan(2);
+	controller.abort();
+
+	await assertResolvesSoon(sizePromise, 'onSizeLessThan() should resolve when a queued task is aborted');
+
+	assert.equal(queue.size, 1);
+	assert.equal(queue.pending, 1);
+
+	blocker.resolve();
+	await queue.onIdle();
+});
+
+test('.onSizeLessThan() does not leak listeners or resolve twice', async () => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const blocker = pDefer<void>();
+
+	queue.add(async () => blocker.promise);
+	queue.add(async () => blocker.promise);
+
+	let calls = 0;
+	const first = (async () => {
+		await queue.onSizeLessThan(2);
+		calls++;
+	})();
+
+	// Size waiters are tracked directly, never through EventEmitter events.
+	assert.equal(queue.listenerCount('next'), 0);
+
+	// One dequeue drops the size from 2 to 1.
+	queue.start();
+	await first;
+	assert.equal(calls, 1);
+
+	// Extra 'next' emissions cannot re-trigger a resolved waiter.
+	queue.emit('next');
+	queue.emit('next');
+	await delay(10);
+	assert.equal(calls, 1);
+	assert.equal(queue.listenerCount('next'), 0);
+
+	// A fresh waiter resolves exactly once via the normal completion dequeue.
+	let remainingCalls = 0;
+	const remaining = (async () => {
+		await queue.onSizeLessThan(1);
+		remainingCalls++;
+	})();
+
+	blocker.resolve();
+	await queue.onIdle();
+	await remaining;
+
+	assert.equal(remainingCalls, 1);
+});
+
 test('.onIdle() - no pending', async () => {
 	const queue = new PQueue();
 	assert.equal(queue.size, 0);

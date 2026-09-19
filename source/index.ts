@@ -65,6 +65,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	readonly #queueAbortListenerCleanupFunctions = new Set<() => void>();
 
+	// Pending `onSizeLessThan()` waiters, each with its own threshold
+	readonly #sizeWaiters = new Set<{limit: number; resolve: () => void}>();
+
 	/**
 	Get or set the default timeout for all tasks. Can be changed at runtime.
 
@@ -318,6 +321,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			if (this.#doesIntervalAllowAnother && this.#doesConcurrentAllowAnother) {
 				const job = this.#queue.dequeue()!;
 
+				// A waiting item left the queue: wake up every size waiter whose
+				// threshold is now met, while tasks may still be running.
+				this.#notifySizeWaiters();
+
 				if (!this.#isIntervalIgnored) {
 					this.#consumeIntervalSlot(now);
 					this.#scheduleRateLimitUpdate();
@@ -377,6 +384,19 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#processQueue(): void {
 		// eslint-disable-next-line no-empty
 		while (this.#tryToStartAnother()) {}
+	}
+
+	// Resolves every `onSizeLessThan()` waiter whose threshold is met by the
+	// current queue size and removes it. Waiters with different limits are
+	// evaluated independently against the same drain; each waiter is removed
+	// at most once, so there are no lingering or duplicate listeners.
+	#notifySizeWaiters(): void {
+		for (const waiter of this.#sizeWaiters) {
+			if (this.#queue.size < waiter.limit) {
+				this.#sizeWaiters.delete(waiter);
+				waiter.resolve();
+			}
+		}
 	}
 
 	get concurrency(): number {
@@ -550,6 +570,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					removeQueuedTask();
 					reject(signal.reason);
 					this.#tryToStartAnother();
+
+					// A waiting item was removed (and a replacement may have started):
+					// notify waiters against the resulting queue size.
+					this.#notifySizeWaiters();
 					this.emit('next');
 				};
 
@@ -620,6 +644,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 		this.#queue = new this.#queueClass();
 
+		// The queue was just emptied: resolve all size waiters immediately,
+		// even if previously started tasks are still running.
+		this.#notifySizeWaiters();
+
 		// Clear interval timer since queue is now empty (consistent with #tryToStartAnother)
 		this.#clearIntervalTimer();
 
@@ -666,12 +694,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	Note that this only limits the number of items waiting to start. There could still be up to `concurrency` jobs already running that this call does not include in its calculation.
 	*/
 	async onSizeLessThan(limit: number): Promise<void> {
-		// Instantly resolve if the queue is empty.
+		// Only the number of items waiting to start is considered, never `pending`,
+		// so this can resolve while started tasks are still running.
 		if (this.#queue.size < limit) {
 			return;
 		}
 
-		await this.#onEvent('next', () => this.#queue.size < limit);
+		return new Promise<void>(resolve => {
+			this.#sizeWaiters.add({limit, resolve});
+		});
 	}
 
 	/**
@@ -764,13 +795,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		});
 	}
 
-	async #onEvent(event: EventName, filter?: () => boolean): Promise<void> {
+	async #onEvent(event: EventName): Promise<void> {
 		return new Promise(resolve => {
 			const listener = () => {
-				if (filter && !filter()) {
-					return;
-				}
-
 				this.off(event, listener);
 				resolve();
 			};
